@@ -1,1 +1,923 @@
+---
+title: "Projekt: Rozhodovacie stromy a súborové metódy"
+author: "Samuel Čierťaský"
+format:
+  html:
+    toc: true
+    toc-depth: 6
+    code-fold: true
+    number-sections: true
+    df-print: paged
+    smooth-scroll: true
+    embed-resources: true
 
+execute:
+  echo: true
+  warning: false
+  message: false
+fontsize: 12pt
+---
+
+```{r}
+#| label: setup
+#| include: true
+# Reproducibility
+set.seed(20251227)
+
+# Packages (automaticky doinštaluje, ak chýbajú)
+pkgs <- c(
+  "tidyverse", "ggplot2", "scales", "broom",
+  "rsample", "yardstick",
+  "rpart", "rpart.plot",
+  "ranger", "vip",
+  "gbm",
+  "pdp",
+  "BART",
+  "knitr", "kableExtra"
+)
+
+to_install <- pkgs[!vapply(pkgs, requireNamespace, FUN.VALUE = logical(1), quietly = TRUE)]
+if (length(to_install) > 0) install.packages(to_install)
+
+# Load
+library(tidyverse)
+library(rsample)
+library(yardstick)
+library(rpart)
+library(rpart.plot)
+library(ranger)
+library(vip)
+library(gbm)
+library(pdp)
+library(BART)
+library(knitr)
+library(kableExtra)
+
+theme_set(theme_minimal(base_size = 12))
+
+# Helper: pekná tabuľka
+kbl <- function(df, caption = NULL) {
+  knitr::kable(df, digits = 4, caption = caption) |>
+    kableExtra::kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+}
+
+# Helper: metriky pre regresiu
+reg_metrics <- function(truth, estimate) {
+  tibble(
+    RMSE = rmse_vec(truth, estimate),
+    MAE  = mae_vec(truth, estimate),
+    R2   = rsq_vec(truth, estimate)
+  )
+}
+```
+
+# **Cieľ projektu**
+
+**Cieľom práce je predikovať cenu nehnuteľnosti na základe jej vlastností (lokalita, veľkosť, dostupnosť služieb, kvalita a pod.) pomocou rozhodovacích stromov a súborových metód.**
+
+V rámci práce je analyzovaný regresný problém a porovnané sú viaceré prístupy – jednoduchý rozhodovací strom, jeho prerezávanie, bagging, random forest, boosting a BART.
+
+Ako doplnková analýza je rovnaký dátový súbor použitý aj na **klasifikačnú úlohu** (rozdelenie nehnuteľností na „drahé“ a „lacné“), čo umožňuje demonštrovať správanie stromových metód aj v klasifikačnom nastavení a porovnať ich výkonnosť pomocou metriky presnosti, ROC kriviek a AUC.
+
+# **Dataset - simulované údaje o cenách nehnuteľností**
+
+## **Generovanie datasetu**
+
+Vygenerujeme dataset, ktorý zámerne obsahuje:
+
+-   nelinearity (napr. efekt vzdialenosti do centra),
+
+-   interakcie (napr. izby × kvalita),
+
+-   šum (nepozorované faktory).
+
+-   pevný počet pozorovaní (n=1500), ktorý zabezpečuje dostatočný objem dát na trénovanie a pozorovanie rôznych modelov
+
+```{r}
+#| label: data-gen
+n <- 1500
+
+dat <- tibble(
+  # "lokalita"
+  dist_center_km = runif(n, 0.2, 25),                 # vzdialenosť do centra
+  transit_score  = pmin(pmax(rnorm(n, 60, 15), 0), 100), # dostupnosť MHD
+  noise_db       = pmin(pmax(rnorm(n, 55, 8), 35), 85),  # hluk
+  crime_index    = rgamma(n, shape = 2.2, rate = 0.18),  # kriminalita (vyššie horšie)
+  parks_1km      = rpois(n, lambda = 2.0),               # parky v okolí
+  schools_score  = pmin(pmax(rnorm(n, 65, 12), 0), 100), # kvalita škôl
+
+  # "nehnuteľnosť"
+  area_m2        = pmin(pmax(rnorm(n, 85, 25), 25), 220),
+  rooms          = pmin(pmax(round(rnorm(n, 3.2, 1.1)), 1), 8),
+  age_years      = pmin(pmax(rnorm(n, 35, 18), 0), 120),
+  quality        = factor(sample(c("low","mid","high"), n, replace = TRUE, prob = c(0.25, 0.55, 0.20)),
+                        levels = c("low","mid","high")),
+  has_garage     = rbinom(n, 1, 0.55),
+  energy_class   = factor(sample(c("A","B","C","D","E"), n, replace = TRUE, prob = c(0.10,0.25,0.35,0.20,0.10)),
+                        levels = c("A","B","C","D","E"))
+) |>
+  mutate(
+    # pomocné transformácie
+    log_crime = log1p(crime_index),
+    # nelineárny "penalizačný" efekt vzdialenosti do centra
+    dist_pen  = 18 * log1p(dist_center_km) + 0.25 * dist_center_km,
+    # kvalita ako číselný efekt
+    qual_eff  = case_when(quality == "low" ~ -25,
+                          quality == "mid" ~ 0,
+                          quality == "high" ~ 35),
+    # energetická trieda
+    energy_eff = case_when(energy_class == "A" ~ 18,
+                           energy_class == "B" ~ 10,
+                           energy_class == "C" ~ 0,
+                           energy_class == "D" ~ -10,
+                           TRUE ~ -22)
+  )
+
+# "pravá" (skrytá) generujúca funkcia ceny (v tis. €)
+# (zámerne nelineárna + interakcie)
+price_true <- with(dat,
+  90 +
+    1.15 * area_m2 +
+    8.0  * rooms +
+    qual_eff +
+    energy_eff +
+    0.45 * transit_score +
+    0.55 * schools_score +
+    6.0  * sqrt(parks_1km + 1) -
+    1.2  * (noise_db - 50) -
+    22.0 * log_crime -
+    dist_pen +
+    0.22 * area_m2 * (quality == "high") +   # interakcia: veľké byty profitujú viac pri vysokej kvalite
+    10.0 * has_garage -
+    0.35 * pmax(age_years - 30, 0) +
+    4.5  * sin(dist_center_km / 3)           # jemná periodicita (napr. zóny mesta)
+)
+
+# pozorovaná cena = true + šum
+dat <- dat |>
+  mutate(
+    price_k = price_true + rnorm(n, sd = 25),           # tis. €
+    price_k = pmax(price_k, 30)                         # nech nie sú záporné
+  ) |>
+  select(-dist_pen, -qual_eff, -energy_eff)
+
+# --- KLASIFIKAČNÝ CIEĽ ---
+# "drahé" = horný kvartil (25% najdrahších)
+thr_q75 <- quantile(dat$price_k, 0.75)
+
+dat <- dat |>
+  mutate(is_expensive = factor(if_else(price_k >= thr_q75, "yes", "no"),
+                               levels = c("no","yes")))
+
+glimpse(dat)
+```
+
+## **Charakteristika použitého datasetu**
+
+Použitý dataset bol vytvorený synteticky s cieľom simulovať realistické podmienky trhu s nehnuteľnosťami a umožniť systematické porovnanie rôznych modelov strojového učenia. Dáta boli generované tak, aby zachytávali typické vzťahy medzi vlastnosťami nehnuteľností a ich cenou, pričom zároveň umožňovali kontrolu nad štruktúrou problému a elimináciu vplyvu neznámych externých faktorov.
+
+Dataset obsahuje premenné opisujúce fyzické vlastnosti nehnuteľnosti (napr. rozloha, počet izieb, vek stavby), lokalitné faktory (vzdialenosť od centra, dostupnosť služieb, miera kriminality, hlučnosť prostredia) aj kvalitatívne charakteristiky (energetická trieda, celková kvalita bývania). Tieto premenné boli zvolené tak, aby zodpovedali typickým determinantom cien nehnuteľností pozorovaným v reálnych dátach.
+
+Hodnota cieľovej premennej – cena nehnuteľnosti – bola generovaná ako nelineárna funkcia viacerých vstupných premenných. Model zahŕňa interakčné efekty (napr. medzi veľkosťou nehnuteľnosti a jej kvalitou), ako aj náhodnú zložku reprezentujúcu nepozorované faktory trhu. Takýto spôsob generovania dát umožňuje vznik realistickej variability a zároveň vytvára prostredie vhodné na testovanie schopnosti modelov zachytiť komplexné vzťahy.
+
+Zámerom použitia syntetických dát nebolo simulovať konkrétny realitný trh, ale vytvoriť kontrolované experimentálne prostredie, v ktorom možno transparentne porovnávať správanie rôznych modelov – od jednoduchých rozhodovacích stromov až po pokročilé súborové metódy. Vďaka tomu je možné lepšie interpretovať rozdiely medzi modelmi a ich schopnosť generalizácie bez vplyvu šumu alebo skreslení typických pre reálne datasety.
+
+# **EDA (prehľad dát)**
+
+```{r}
+#| label: eda
+dat |>
+  summarise(
+    n = n(),
+    price_mean = mean(price_k),
+    price_sd   = sd(price_k),
+    price_min  = min(price_k),
+    price_max  = max(price_k)
+  ) |>
+  kbl("Základný prehľad cieľovej premennej (cena v tis. €)")
+```
+
+Základná deskriptívna analýza ukazuje, že priemerná cena nehnuteľnosti v dátach je približne 189 tis. €, pričom ceny sa pohybujú v pomerne širokom intervale od 30 do 387 tis. €. Relatívne vysoká smerodajná odchýlka naznačuje výraznú variabilitu cien, čo poukazuje na heterogénnosť dát a opodstatňuje použitie flexibilných modelov schopných zachytiť nelineárne vzťahy.
+
+```{r}
+#| label: eda-plots
+p1 <- ggplot(dat, aes(price_k)) +
+  geom_histogram(bins = 40) +
+  labs(title = "Rozdelenie ceny (price_k)", x = "Cena (tis. €)", y = "Počet")
+
+p2 <- ggplot(dat, aes(dist_center_km, price_k)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(se = FALSE) +
+  labs(title = "Cena vs vzdialenosť do centra", x = "Vzdialenosť (km)", y = "Cena (tis. €)")
+
+p1
+p2
+```
+
+Histogram ceny nehnuteľností ukazuje približne **symetrické, mierne pravostranné rozdelenie** s vrcholom okolo hodnoty 180–200 tis. €. Väčšina pozorovaní sa nachádza v intervale približne 120–260 tis. €, pričom extrémne nízke a vysoké ceny sa vyskytujú len zriedkavo. Rozdelenie neobsahuje výrazné odľahlé hodnoty, čo naznačuje, že dáta sú vhodné pre ďalšie modelovanie bez potreby výrazných transformácií cieľovej premennej.
+
+Z grafu závislosti ceny od vzdialenosti od centra je zrejmý **mierne klesajúci trend** – s rastúcou vzdialenosťou od centra má cena nehnuteľnosti tendenciu klesať. Zároveň je však rozptyl hodnôt pomerne veľký, čo naznačuje, že samotná vzdialenosť od centra nevysvetľuje cenu dostatočne a jej vplyv je ovplyvnený ďalšími faktormi (napr. veľkosť, kvalita, dostupnosť služieb). Tento nelineárny a šumom ovplyvnený vzťah podporuje použitie flexibilnejších modelov, ako sú rozhodovacie stromy a súborové metódy.
+
+# **Split dát (train/test)**
+
+```{r}
+#| label: split
+set.seed(20251227)
+spl <- initial_split(dat, prop = 0.8)
+train <- training(spl)
+test  <- testing(spl)
+train_reg <- train |> dplyr::select(-is_expensive)
+test_reg  <- test  |> dplyr::select(-is_expensive)
+
+c(n_train = nrow(train), n_test = nrow(test)) |>
+  as.data.frame() |>
+  kbl("Počet pozorovaní v train/test")
+```
+
+Dáta boli rozdelené na **trénovaciu** a **testovaciu** množinu v pomere **80 : 20**, čo zodpovedá 1200 pozorovaniam v trénovacej a 300 pozorovaniam v testovacej množine. Takéto rozdelenie poskytuje dostatočný počet dát na učenie modelov a zároveň umožňuje objektívne vyhodnotenie ich generalizačnej schopnosti na nezávislých pozorovaniach. Zároveň sme vytvoril aj testovaciu a trénovaciu vzorku, ktorá neobsahuje prediktor is_expensive, ktorý by nám v regresea spôsoboval data leakedge.
+
+# **Rozhodovací strom (regresný)**
+
+## **Veľký strom a problém overfittingu**
+
+Najprv necháme strom “narásť” (malá penalizácia, malý minbucket), aby sme videli riziko preučenia.
+
+```{r}
+#| label: tree-big
+fit_tree_big <- rpart(
+  price_k ~ .,
+  data = train_reg,
+  method = "anova",
+  control = rpart.control(cp = 0.0005, minbucket = 8, maxdepth = 30)
+)
+
+#fit_tree_big
+```
+
+```{r}
+#| label: tree-big-plot
+rpart.plot(fit_tree_big, main = "Veľký (takmer neorezaný) regresný strom", roundint = FALSE)
+```
+
+Vyhodnotenie na train vs test:
+
+```{r}
+#| label: tree-big-eval
+pred_train <- predict(fit_tree_big, newdata = train_reg)
+pred_test  <- predict(fit_tree_big, newdata = test_reg)
+
+bind_rows(
+  reg_metrics(train_reg$price_k, pred_train) |> mutate(dataset = "train"),
+  reg_metrics(test_reg$price_k,  pred_test)  |> mutate(dataset = "test")
+) |>
+  select(dataset, RMSE, MAE, R2) |>
+  kbl("Výkon veľkého stromu: train vs test")
+```
+
+Na základe dosiahnutých výsledkov možno pozorovať, že veľký regresný strom dosahuje pomerne dobrý výkon na trénovacej množine (RMSE ≈ 26.2, R² ≈ 0.77), čo naznačuje vysokú schopnosť modelu prispôsobiť sa dostupným dátam. Tento výsledok však nie je možné považovať za spoľahlivý ukazovateľ kvality modelu, keďže ide o výkon na trénovacích dátach a model zatiaľ nebol porovnaný s alternatívnymi prístupmi.
+
+Na testovacej množine dochádza k výraznému poklesu výkonnosti (RMSE ≈ 39.9, R² ≈ 0.48), čo poukazuje na obmedzenú schopnosť generalizácie. Rozdiel medzi výkonom na trénovacích a testovacích dátach naznačuje, že model je do istej miery preučený, keďže vytvára veľmi komplexnú štruktúru založenú na veľkom počte rozdelení a čiastočne zachytáva aj náhodný šum v dátach.
+
+Z tohto dôvodu je opodstatnené ďalej skúmať vplyv regulácie modelu, konkrétne prerezávania stromu, s cieľom znížiť jeho komplexnosť a zlepšiť generalizačné vlastnosti na nové, nevidené dáta.
+
+## **Prerezávanie stromu (cost-complexity pruning + CV)**
+
+V rpart si vieme pozrieť tabuľku komplexity (cptable) a vybrať vhodné cp (často podľa CV chyby).
+
+```{r}
+#| label: tree-cp
+cp_tab <- as.data.frame(fit_tree_big$cptable)
+colnames(cp_tab) <- make.names(colnames(cp_tab))
+
+cp_tab <- cp_tab |>
+  rownames_to_column("row") |>
+  select(
+    cp = CP,
+    nsplits = nsplit,
+    rel_error = rel.error,
+    xerror,
+    xstd
+  )
+
+kbl(cp_tab, "rpart cptable (rel_error = train, xerror = CV odhad)")
+```
+
+Vyberieme cp s minimálnym xerror (príp. “1-SE” pravidlo). Tu ukážeme obe možnosti a zvolíme “1-SE” ako konzervatívnejší prístup.
+
+```{r}
+#| label: tree-prune
+# min xerror
+i_min <- which.min(cp_tab$xerror)
+cp_min <- cp_tab$cp[i_min]
+
+# 1-SE: najjednoduchší strom, ktorého xerror <= min(xerror) + xstd(min)
+thr <- cp_tab$xerror[i_min] + cp_tab$xstd[i_min]
+cp_1se <- cp_tab |>
+  filter(xerror <= thr) |>
+  slice_head(n = 1) |>
+  pull(cp)
+
+c(cp_min = cp_min, cp_1se = cp_1se)
+```
+
+```{r}
+#| label: tree-pruned-fit
+fit_tree_pruned <- prune(fit_tree_big, cp = cp_1se)
+
+rpart.plot(fit_tree_pruned, main = "Prerezaný regresný strom (1-SE)", roundint = FALSE)
+```
+
+```{r}
+#| label: tree-pruned-eval
+pred_test_pruned <- predict(fit_tree_pruned, newdata = test_reg)
+bind_rows(
+  reg_metrics(test_reg$price_k, pred_test)        |> mutate(model = "Strom (veľký)"),
+  reg_metrics(test_reg$price_k, pred_test_pruned) |> mutate(model = "Strom (prerezaný)")
+) |>
+  select(model, RMSE, MAE, R2) |>
+  arrange(RMSE) |>
+  kbl("Porovnanie stromov na test set-e")
+```
+
+Po aplikovaní prerezávania pomocou pravidla 1-SE dochádza k miernej zmene výkonnosti modelu na testovacej množine. Prerezaný strom dosahuje nižšie hodnoty RMSE a MAE v porovnaní s pôvodným (neorezaným) stromom, čo naznačuje mierne zlepšenie presnosti predikcie v absolútnych metrikách chyby.
+
+Na druhej strane hodnota koeficientu determinácie R² zostáva veľmi podobná a dokonca mierne klesá, čo poukazuje na to, že prerezávanie nemalo jednoznačný pozitívny vplyv na schopnosť modelu vysvetľovať variabilitu cieľovej premennej. Celkový rozdiel medzi oboma modelmi je však malý, čo naznačuje, že pôvodný strom nebol výrazne preučený.
+
+Tento výsledok ukazuje, že cost-complexity prerezávanie môže viesť k jednoduchšiemu modelu s porovnateľnou výkonnosťou, avšak jeho prínos z hľadiska presnosti a vysvetľovacej schopnosti závisí od konkrétnej štruktúry dát a miery komplexnosti pôvodného stromu.
+
+# **Súborové metódy (ensemble)**
+
+Samotný strom má často vyššiu varianciu; agregácia viacerých stromov typicky zlepší presnosť.
+
+## **Bagging (bootstrap aggregation) + OOB odhad**
+
+Bagging je špeciálny prípad random forest, kde pri každom split-e uvažujeme **všetky premenné** (mtry = p). 
+
+Použijeme balík **ranger**, ktorý umožňuje rýchlu implementáciu baggingu a zároveň poskytuje odhad chyby pomocou OOB vzorkovania.
+
+```{r}
+#| label: bagging
+p <- ncol(select(train_reg, -price_k))
+
+fit_bag <- ranger(
+  price_k ~ .,
+  data = train_reg,
+  num.trees = 800,
+  mtry = p,
+  min.node.size = 8,
+  importance = "permutation",
+  oob.error = TRUE,
+  seed = 20251227
+)
+
+fit_bag
+```
+
+Model založený na metóde bagging dosahuje strednú hodnotu OOB chyby (RMSE ≈ 31.1) a koeficient determinácie R² ≈ 0.68, čo poukazuje na primeranú, hoci nie výnimočnú schopnosť generalizácie. Výsledky naznačujú, že agregácia viacerých stromov vedie k stabilnejšiemu výkonu v porovnaní s jednoduchým rozhodovacím stromom, avšak bez dramatického zlepšenia presnosti.
+
+Hodnota OOB chyby poskytuje spoľahlý interný odhad generalizačného výkonu a naznačuje, že model nie je výrazne preučený. V porovnaní s jednotlivým stromom bagging znižuje variabilitu predikcií, no stále zaostáva za výkonnejšími súborovými metódami, ako sú Random Forest alebo boosting.
+
+### OOB RMSE vs test RMSE
+
+```{r}
+#| label: bagging-eval
+pred_bag_test <- predict(fit_bag, data = test_reg)$predictions
+
+tibble(
+  OOB_RMSE  = sqrt(fit_bag$prediction.error),
+  Test_RMSE = rmse_vec(test_reg$price_k, pred_bag_test),
+  Test_R2   = rsq_vec(test_reg$price_k,  pred_bag_test)
+) |>
+  kbl("Bagging: OOB vs test výkon")
+```
+
+OOB chyba je veľmi podobná chybe na testovacej množine, čo naznačuje, že model má dobrú schopnosť generalizácie a nie je výrazne preučený. Bagging tak poskytuje stabilnejší a presnejší odhad než samostatný strom.
+
+### Významnosť premenných
+
+```{r}
+#| label: bagging-vip
+vip(fit_bag, num_features = 15, geom = "col", aesthetics = list(alpha = 0.9)) +
+  labs(title = "Bagging – permutation variable importance (top 15)")
+```
+
+Z grafu vyplýva, že najvýznamnejšími faktormi ovplyvňujúcimi predikciu ceny nehnuteľnosti sú jej rozloha (area_m2) a kvalita bývania (quality). Tieto premenné majú dominantný vplyv na rozhodovanie modelu, čo zodpovedá ekonomickej intuící aj empirickým poznatkom z reálnych trhov s nehnuteľnosťami.
+
+Menší, no stále nenulový vplyv majú lokalitné faktory, ako je vzdialenosť od centra (dist_center_km) a miera kriminality (crime_index, resp. log_crime), ktoré zachytávajú atraktivitu prostredia. Ostatné premenné, ako hluk, energetická trieda, dostupnosť služieb či počet izieb, zohrávajú skôr doplnkovú úlohu. Výsledky tak potvrdzujú, že cena nehnuteľnosti je determinovaná kombináciou viacerých faktorov, pričom najväčší význam majú charakteristiky priamo súvisiace s veľkosťou a kvalitou bývania.
+
+## **Random Forest**
+
+Random forest znižuje koreláciu stromov tým, že pri každom split-e zvažuje len náhodný podvýber premenných (typicky mtry \~ p/3 pre regresiu). 
+
+```{r}
+#| label: rf
+fit_rf <- ranger(
+  price_k ~ .,
+  data = train_reg,
+  num.trees = 1200,
+  mtry = max(1, floor(p/3)),
+  min.node.size = 6,
+  importance = "permutation",
+  oob.error = TRUE,
+  seed = 20251227
+)
+
+fit_rf
+```
+
+Model Random Forest dosahuje dobrý výkon, čo potvrdzuje hodnota OOB chyby (RMSE ≈ 31.0) a koeficient determinácie R² ≈ 0.68. Tieto výsledky naznačujú, že model dokáže vysvetliť približne dve tretiny variability cieľovej premennej a má stabilnú generalizačnú schopnosť.
+
+V porovnaní s jednoduchým rozhodovacím stromom predstavuje Random Forest výrazné zlepšenie, keďže znižuje varianciu modelu prostredníctvom agregácie viacerých stromov a náhodného výberu premenných pri každom delení. Na druhej strane jeho výkon mierne zaostáva za metódami založenými na sekvenčnom učení, ako je gradient boosting alebo BART, ktoré dokážu efektívnejšie zachytiť komplexné nelineárne vzťahy v dátach.
+
+Výsledky potvrdzujú, že Random Forest predstavuje robustný a spoľahlivý kompromis medzi presnosťou a stabilitou, najmä v situáciách, kde je prioritou dobrá generalizácia a nižšia citlivosť na nastavenie hyperparametrov.
+
+### OOB RMSE vs test RMSE
+
+```{r}
+#| label: rf-eval
+pred_rf_test <- predict(fit_rf, data = test_reg)$predictions
+
+tibble(
+  OOB_RMSE  = sqrt(fit_rf$prediction.error),
+  Test_RMSE = rmse_vec(test_reg$price_k, pred_rf_test),
+  Test_R2   = rsq_vec(test_reg$price_k,  pred_rf_test)
+) |>
+  kbl("Random Forest: OOB vs test výkon")
+```
+
+Porovnanie OOB chyby a chyby na testovacej množine ukazuje len mierny rozdiel (OOB RMSE ≈ 31.0 vs. test RMSE ≈ 32.5), čo naznačuje, že model Random Forest nie je výrazne preučený a zachováva si stabilný výkon aj na nezávislých dátach. Hodnota koeficientu determinácie na testovacej množine (R² ≈ 0.65) potvrdzuje dobrú generalizačnú schopnosť modelu.
+
+Vďaka použitiu náhodného výberu premenných pri každom delení stromov (parameter *mtry*) dochádza k zníženiu korelácie medzi jednotlivými stromami, čo vedie k nižšej variancii modelu a lepšej generalizácii v porovnaní s jednoduchým rozhodovacím stromom. Random Forest tak predstavuje robustný a spoľahlivý prístup k regresnej úlohe s vyváženým pomerom medzi presnosťou a stabilitou.
+
+### Významnosť premenných
+
+```{r}
+#| label: rf-vip
+vip(fit_rf, num_features = 15, geom = "col", aesthetics = list(alpha = 0.9)) +
+  labs(title = "Random Forest – permutation variable importance (top 15)")
+```
+
+Z grafu vyplýva, že najväčší vplyv na predikciu ceny nehnuteľnosti majú **rozloha nehnuteľnosti (area_m2)** a **kvalita bývania (quality)**, ktoré výrazne dominujú ostatným premenným. Medzi ďalšie dôležité faktory patria **vzdialenosť od centra (dist_center_km)** a **mieru kriminality v okolí (crime_index, log_crime)**.
+
+Ostatné premenné, ako hluk, energetická trieda, dostupnosť dopravy či počet izieb, majú v modeli menší, avšak nenulový vplyv. Výsledky potvrdzujú, že Random Forest dokáže identifikovať kľúčové charakteristiky ovplyvňujúce cenu nehnuteľnosti a zachytiť ich **relatívny význam v súlade s očakávaniami z reálneho trhu s nehnuteľnosťami**.
+
+## **Boosting (gradient boosting)**
+
+Boosting rastie sekvenčne (každý ďalší strom opravuje chyby predchádzajúcich) a má ladiace parametre ako počet stromov, hĺbka interakcií a shrinkage. 
+
+Použijeme gbm.
+
+```{r}
+#| label: boost-fit
+# GBM potrebuje numerické vstupy; one-hot kódovanie cez model.matrix
+x_train <- model.matrix(price_k ~ ., data = train_reg)[, -1]
+x_test  <- model.matrix(price_k ~ ., data = test_reg)[, -1]
+
+y_train <- train_reg$price_k
+y_test  <- test_reg$price_k
+
+train_gbm <- as.data.frame(x_train) |> dplyr::mutate(price_k = y_train)
+test_gbm  <- as.data.frame(x_test)  |> dplyr::mutate(price_k = y_test)
+
+fit_gbm <- gbm(
+  price_k ~ .,
+  data = train_gbm,
+  distribution = "gaussian",
+  n.trees = 7000,
+  interaction.depth = 4,
+  shrinkage = 0.01,
+  n.minobsinnode = 10,
+  bag.fraction = 0.7,
+  train.fraction = 1.0,
+  verbose = FALSE
+)
+
+fit_gbm
+```
+
+Model Gradient Boosting využívajúci 7000 stromov a nízku hodnotu parametra *shrinkage* dosahuje stabilný výkon a efektívne zachytáva nelineárne vzťahy v dátach, pričom skutočnosť, že väčšina premenných má nenulový vplyv, potvrdzuje schopnosť modelu využívať široké spektrum informácií pri predikcii ceny nehnuteľnosti.
+
+Vyberieme optimálny počet stromov cez OOB (v gbm: gbm.perf).
+
+```{r}
+#| label: boost-perf
+best_trees <- gbm.perf(fit_gbm, method = "OOB", plot.it = TRUE)
+```
+
+Na grafe je zobrazený priebeh OOB chyby v závislosti od počtu stromov v modeli Gradient Boosting. S rastúcim počtom stromov dochádza k postupnému znižovaniu chyby, pričom po určitom bode sa zlepšenie spomaľuje. Zvislá čiara označuje optimálny počet stromov vybraný pomocou OOB kritéria, pri ktorom je dosiahnutý najlepší kompromis medzi presnosťou a zložitosťou modelu. 
+
+### RMSE vs MAE
+
+```{r}
+best_trees
+```
+
+```{r}
+#| label: boost-eval
+pred_gbm_test <- predict(fit_gbm, newdata = test_gbm, n.trees = best_trees)
+
+reg_metrics(y_test, pred_gbm_test) |>
+  kbl("Boosting (gbm): test metriky")
+```
+
+Na základe OOB krivky bol ako optimálny zvolený model s približne **728 stromami**, pri ktorom sa dosahuje najnižšia validačná chyba. Výsledný model dosahuje hodnotu **RMSE ≈ 30.3** a **R² ≈ 0.69**, čo predstavuje ďalšie zlepšenie oproti baggingu aj klasickému random forestu.
+
+### **Relatívny vplyv premenných**
+
+```{r}
+#| label: boost-influence
+infl <- summary(fit_gbm, n.trees = best_trees, plotit = FALSE) |>
+  as_tibble()
+
+infl |> slice_head(n = 15) |> kbl("Boosting: relatívny vplyv (top 15)")
+```
+
+Z výsledkov vyplýva, že **najvýznamnejším faktorom ovplyvňujúcim cenu nehnuteľnosti je rozloha nehnuteľnosti (area_m2)**, ktorá má výrazne najvyšší relatívny vplyv. Veľmi dôležitú úlohu zohráva aj **kvalita bývania**, najmä kategória *high*, čo potvrdzuje silný vzťah medzi kvalitatívnymi charakteristikami a cenou nehnuteľnosti.
+
+Medzi ďalšie významné faktory patria **vzdialenosť od centra (dist_center_km)** a **miera kriminality v okolí (crime_index)**, ktoré majú výrazný, no sekundárny vplyv. Negatívny efekt hluku (noise_db) a mierne pozitívny vplyv dostupnosti verejnej dopravy a škôl naznačujú, že model zachytáva aj jemnejšie lokalitné charakteristiky.
+
+Ostatné premenné, ako počet izieb, vek nehnuteľnosti či energetická trieda, majú v modeli menší, doplnkový význam. Celkovo výsledky potvrdzujú, že boosting efektívne identifikuje kľúčové determinanty ceny nehnuteľností a zachytáva **realistické nelineárne vzťahy** medzi ich vlastnosťami a cenou.
+
+### **Parciálne závislosti**
+
+```{r}
+#| label: boost-pdp
+# Parciálne efekty pre vybrané premenné
+vars_show <- c("dist_center_km", "area_m2", "schools_score", "noise_db")
+for (v in vars_show) {
+  pd <- partial(fit_gbm, pred.var = v, n.trees = best_trees, train = train_gbm)
+  print(
+    autoplot(pd) + labs(title = paste("Boosting – parciálny efekt:", v), x = v, y = "Odhadovaný efekt")
+  )
+}
+```
+
+Parciálne závislosti ilustrujú, ako jednotlivé premenné ovplyvňujú predikovanú cenu nehnuteľnosti pri fixovaní ostatných vstupov.
+
+Z grafu pre **vzdialenosť od centra (dist_center_km)** je zrejmé, že s rastúcou vzdialenosťou cena systematicky klesá. Tento pokles je výraznejší najmä v prvých kilometroch, čo zodpovedá očakávanému efektu atraktivity centrálnej polohy.
+
+V prípade **rozlohy nehnuteľnosti (area_m2)** je pozorovaný jednoznačne rastúci trend – väčšia plocha vedie k vyššej odhadovanej cene, pričom nárast je približne lineárny v strednom rozsahu hodnôt.
+
+Graf pre **skóre škôl (schools_score)** ukazuje mierny, ale konzistentný pozitívny vplyv, čo naznačuje, že dostupnosť kvalitných vzdelávacích inštitúcií zvyšuje atraktivitu lokality.
+
+Naopak, **hluk (noise_db)** má negatívny vplyv – s rastúcou hlučnosťou dochádza k postupnému poklesu predikovanej ceny, pričom efekt je výraznejší pri vyšších hodnotách hluku.
+
+Celkovo tieto parciálne závislosti potvrdzujú, že model zachytáva realistické a intuitívne vzťahy medzi vlastnosťami nehnuteľností a ich cenou, čo podporuje jeho interpretovateľnosť a praktickú použiteľnosť.
+
+## **BART (Bayesian Additive Regression Trees)**
+
+BART je bayesovská súborová metóda založená na MCMC: poskytuje nielen bodový odhad, ale aj **neistotu** (intervaly). 
+
+```{r}
+#| label: bart-fit
+# BART potrebuje maticu prediktorov
+xtr <- x_train
+xte <- x_test
+
+fit_bart <- gbart(
+  x.train = xtr,
+  y.train = y_train,
+  x.test  = xte,
+  ntree = 200,
+  nskip = 200,     # burn-in
+  ndpost = 1000,   # počet posterior draws
+  printevery = 500
+)
+
+# Posterior mean predictions
+pred_bart_test_mean <- fit_bart$yhat.test.mean
+```
+
+Model BART bol úspešne natrénovaný s využitím 200 stromov a vykazuje stabilnú konvergenciu počas MCMC vzorkovania. Odhadovaná hodnota reziduálnej variability naznačuje dobrú schopnosť modelu zachytiť štruktúru dát, pričom použité regularizačné mechanizmy bránia preučeniu. Výsledok potvrdzuje, že BART predstavuje robustnú alternatívu k ostatným stromovým metódam pri modelovaní nelineárnych vzťahov.
+
+### RMSE vs MAE
+
+```{r}
+#| label: bart-eval
+reg_metrics(y_test, pred_bart_test_mean) |>
+  kbl("BART: test metriky (posterior mean)")
+```
+
+Model BART dosahuje najlepší výkon spomedzi všetkých uvažovaných prístupov, čo potvrdzuje najnižšia hodnota RMSE (≈ 28.8) a najvyššia hodnota koeficientu determinácie (R² ≈ 0.71). Výsledky naznačujú, že BART dokáže veľmi dobre zachytiť nelineárne vzťahy v dátach a poskytuje najpresnejšie predikcie ceny nehnuteľností zo všetkých porovnávaných modelov.
+
+### **Predikčné intervaly z BART**
+
+```{r}
+#| label: bart-intervals
+# 90% interval (5% - 95%)
+lo <- apply(fit_bart$yhat.test, 2, quantile, probs = 0.05)
+hi <- apply(fit_bart$yhat.test, 2, quantile, probs = 0.95)
+
+df_int <- tibble(
+  truth = y_test,
+  mean  = pred_bart_test_mean,
+  lo90  = lo,
+  hi90  = hi
+)
+
+# coverage
+coverage <- mean(df_int$truth >= df_int$lo90 & df_int$truth <= df_int$hi90)
+
+tibble(
+  interval = "90% BART interval",
+  coverage = coverage,
+  avg_width = mean(df_int$hi90 - df_int$lo90)
+) |>
+  kbl("BART: kvalita predikčných intervalov na test set-e")
+```
+
+```{r}
+#| label: bart-intervals-plot
+df_int |>
+  mutate(id = row_number()) |>
+  slice_sample(n = 120) |>
+  ggplot(aes(x = truth, y = mean)) +
+  geom_abline() +
+  geom_errorbar(aes(ymin = lo90, ymax = hi90), alpha = 0.35) +
+  geom_point(alpha = 0.6) +
+  labs(
+    title = "BART: bodové predikcie + 90% predikčný interval (subset)",
+    x = "Skutočná cena (tis. €)",
+    y = "Predikcia (posterior mean, tis. €)"
+  )
+```
+
+Graf znázorňuje bodové predikcie modelu BART spolu s 90 % predikčnými intervalmi. Väčšina skutočných hodnôt sa nachádza v rámci týchto intervalov, čo naznačuje, že model dokáže primerane zachytiť neistotu predikcie. Šírka intervalov sa zvyšuje pri vyšších hodnotách ceny, čo odráža rastúcu neistotu pri extrémnejších pozorovaniach.
+
+Zároveň je však zrejmé, že skutočná miera pokrytia je nižšia než nominálnych 90 %, čo naznačuje, že predikčné intervaly sú v tomto nastavení mierne podhodnotené. Táto skutočnosť môže súvisieť s nastavením priorov alebo s vlastnosťami samotných dát. Napriek tomu model BART poskytuje cennú informáciu o relatívnej neistote predikcií a predstavuje robustný nástroj na modelovanie nelineárnych vzťahov.
+
+# **Porovnanie všetkých metód na testovanom datasete**
+
+```{r}
+#| label: compare
+pred_tree_pr <- predict(fit_tree_pruned, newdata = test_reg)
+pred_bag     <- pred_bag_test
+pred_rf      <- pred_rf_test
+pred_boost   <- pred_gbm_test
+pred_bart    <- pred_bart_test_mean
+
+res <- bind_rows(
+  reg_metrics(y_test, pred_tree_pr) |> mutate(model = "Prerezaný strom"),
+  reg_metrics(y_test, pred_bag)     |> mutate(model = "Bagging (ranger)"),
+  reg_metrics(y_test, pred_rf)      |> mutate(model = "Random Forest (ranger)"),
+  reg_metrics(y_test, pred_boost)   |> mutate(model = "Boosting (gbm)"),
+  reg_metrics(y_test, pred_bart)    |> mutate(model = "BART (gbart)")
+) |>
+  select(model, RMSE, MAE, R2) |>
+  arrange(RMSE)
+
+kbl(res, "Test metriky – porovnanie metód")
+```
+
+```{r}
+#| label: compare-plot
+res |>
+  pivot_longer(cols = c(RMSE, MAE, R2), names_to = "metric", values_to = "value") |>
+  ggplot(aes(x = reorder(model, value), y = value)) +
+  geom_col(alpha = 0.9) +
+  coord_flip() +
+  facet_wrap(~metric, scales = "free") +
+  labs(title = "Porovnanie metód na test set-e", x = NULL, y = NULL)
+```
+
+Porovnanie jednotlivých prístupov ukazuje, že **model BART dosahuje najlepší celkový výkon**, keď dosahuje najnižšiu hodnotu RMSE a zároveň najvyššie R\^2. Nasleduje gradient boosting a random forest, ktoré poskytujú veľmi podobné, mierne slabšie výsledky. Najslabší výkon vykazuje prerezaný rozhodovací strom, čo potvrdzuje, že jednoduché stromy majú obmedzenú schopnosť zachytiť komplexné vzťahy v dátach.
+
+Z výsledkov vyplýva, že **súborové metódy výrazne prekonávajú jednotlivé stromy**, pričom medzi nimi dosahuje najlepšie výsledky BART, ktorý kombinuje vysokú presnosť s dobrou generalizáciou. Táto analýza potvrdzuje vhodnosť použitia pokročilých ensemble prístupov pri modelovaní cien nehnuteľností.
+
+# **Klasifikácia: drahé vs lacné**
+
+V tejto časti spravíme klasifikačnú úlohu: predikovať, či je nehnuteľnosť **drahá** (horný kvartil ceny) alebo **nie**.
+
+Ukážeme klasifikačný strom a random forest, vyhodnotíme ich cez **confusion matrix**, **accuracy/F1** a **ROC/AUC**.
+
+## **Train/test split so stratifikáciou**
+
+```{r}
+#| label: cls-split
+set.seed(20251227)
+spl_cls <- initial_split(dat, prop = 0.8, strata = is_expensive)
+train_cls <- training(spl_cls)
+test_cls  <- testing(spl_cls)
+
+# kontrola pomeru tried
+bind_rows(
+  train_cls |> count(is_expensive) |> mutate(dataset = "train"),
+  test_cls  |> count(is_expensive) |> mutate(dataset = "test")
+) |>
+  group_by(dataset) |>
+  mutate(prop = n / sum(n)) |>
+  ungroup() |>
+  kbl("Pomer tried (stratifikovaný split)")
+```
+
+Dáta boli rozdelené na trénovaciu a testovaciu množinu pomocou stratifikovaného výberu, aby bol v oboch častiach zachovaný rovnaký pomer tried *„drahá“* a *„lacná“* nehnuteľnosť. V trénovacej množine tvorí trieda „drahá“ približne 25 % pozorovaní, rovnako ako v testovacej množine. Takýto postup zabezpečuje, že model je trénovaný aj vyhodnocovaný na dátach s porovnateľnou distribúciou tried, čím sa znižuje riziko skreslenia výsledkov pri klasifikačnej úlohe.
+
+## **Klasifikačný strom**
+
+```{r}
+#| label: cls-tree-fit
+fit_tree_cls <- rpart(
+  is_expensive ~ . - price_k,
+  data = train_cls,
+  method = "class",
+  control = rpart.control(cp = 0.001, minbucket = 15, maxdepth = 20)
+)
+
+rpart.plot(fit_tree_cls, main = "Klasifikačný strom: drahé vs lacné", roundint = FALSE)
+```
+
+Zobrazený klasifikačný strom ilustruje rozhodovací proces pri rozlišovaní medzi drahými a lacnými nehnuteľnosťami. Najdôležitejším rozdeľujúcim kritériom je **kvalita nehnuteľnosti**, ktorá tvorí koreň stromu, čo naznačuje jej dominantný vplyv na výslednú cenu. V ďalších úrovniach zohrávajú významnú úlohu predovšetkým **rozloha**, **vzdialenosť od centra** a **úroveň kriminality**, ktoré ďalej spresňujú rozhodnutie modelu.
+
+Strom zároveň ukazuje, že nehnuteľnosti s vyššou kvalitou a väčšou rozlohou majú výrazne vyššiu pravdepodobnosť zaradenia medzi drahé, zatiaľ čo menšie objekty nachádzajúce sa ďalej od centra alebo v oblastiach s vyššou kriminalitou sú častejšie klasifikované ako lacné. Výsledná štruktúra stromu tak poskytuje intuitívny a interpretovateľný pohľad na rozhodovací proces modelu.
+
+```{r}
+#| label: cls-tree-eval
+# Predikcie: trieda aj pravdepodobnosť triedy "yes"
+tree_class <- predict(fit_tree_cls, newdata = test_cls, type = "class")
+tree_prob  <- predict(fit_tree_cls, newdata = test_cls, type = "prob")[, "yes"]
+
+# Confusion matrix
+conf_mat(
+  tibble(truth = test_cls$is_expensive, estimate = tree_class),
+  truth = truth, estimate = estimate
+)
+```
+
+Konfúzna matica ukazuje, že model správne klasifikoval **203 lacných** a **32 drahých** nehnuteľností. Zároveň došlo k **43 falošne pozitívnym** a **22 falošne negatívnym** predikciám. Model je teda presnejší pri identifikácii lacnejších nehnuteľností, zatiaľ čo pri drahých objektoch je mierne konzervatívny. Napriek tomu vykazuje rozumnú rovnováhu medzi citlivosťou a presnosťou, čo je typické pre modely optimalizované na celkovú presnosť.
+
+```{r}
+# Základné metriky
+tibble(
+  Accuracy = accuracy_vec(test_cls$is_expensive, tree_class),
+  F1 = f_meas_vec(test_cls$is_expensive, tree_class, event_level = "second")
+) |>
+  kbl("Klasifikačný strom – metriky (test)")
+```
+
+Klasifikačný strom dosahuje **presnosť 78,3 %**, čo znamená, že väčšinu prípadov klasifikuje správne. Hodnota **F1 skóre ≈ 0,50** však naznačuje nevyvážený výkon medzi presnosťou a citlivosťou, najmä pri triede „drahé“. Model je teda schopný pomerne spoľahlivo rozlišovať medzi triedami, no v identifikácii drahších nehnuteľností má stále priestor na zlepšenie.
+
+```{r}
+#| label: cls-tree-roc
+roc_tree <- roc_curve(
+  tibble(truth = test_cls$is_expensive, .pred_yes = tree_prob),
+  truth = truth, .pred_yes,
+  event_level = "second"
+)
+
+auc_tree <- roc_auc(
+  tibble(truth = test_cls$is_expensive, .pred_yes = tree_prob),
+  truth = truth, .pred_yes,
+  event_level = "second"
+)
+
+auc_tree
+autoplot(roc_tree) + labs(title = "ROC – klasifikačný strom")
+```
+
+ROC krivka klasifikačného stromu sa nachádza výrazne nad diagonálou náhodného klasifikátora a dosahuje hodnotu **AUC ≈ 0.81**, čo poukazuje na dobrú schopnosť modelu rozlišovať medzi triedami *„drahá“* a *„lacná“* nehnuteľnosť. Aj keď výkon nedosahuje úroveň komplexnejších metód, ako je Random Forest alebo Boosting, strom dokáže zachytiť základné vzory v dátach a poskytuje interpretovateľný základ pre klasifikáciu.
+
+## **Random Forest (klasifikácia)**
+
+```{r}
+#| label: cls-rf-fit
+p_cls <- ncol(select(train_cls, -price_k, -is_expensive))
+
+fit_rf_cls <- ranger(
+  is_expensive ~ . - price_k,
+  data = train_cls,
+  probability = TRUE,
+  num.trees = 1000,
+  mtry = max(1, floor(sqrt(p_cls))),  # typická voľba pre klasifikáciu
+  min.node.size = 10,
+  importance = "permutation",
+  seed = 20251227
+)
+
+fit_rf_cls
+```
+
+Model Random Forest bol natrénovaný s 1000 stromami a využíva náhodný výber premenných pri každom delení, čo znižuje koreláciu medzi stromami a zlepšuje generalizačnú schopnosť. Dosiahnutá hodnota **Brierovej chyby ≈ 0.107** indikuje pomerne dobrú kalibráciu pravdepodobnostných predikcií a lepší výkon v porovnaní s jednoduchým klasifikačným stromom.
+
+```{r}
+#| label: cls-rf-eval
+pred_rf_cls <- predict(fit_rf_cls, data = test_cls)
+rf_prob_yes <- pred_rf_cls$predictions[, "yes"]
+rf_class    <- if_else(rf_prob_yes >= 0.5, "yes", "no") |> factor(levels = c("no","yes"))
+
+conf_mat(
+  tibble(truth = test_cls$is_expensive, estimate = rf_class),
+  truth = truth, estimate = estimate
+)
+```
+
+Konfúzna matica ukazuje, že model správne klasifikoval **213 lacných** a **39 drahých** nehnuteľností. Zároveň došlo k **36 falošne pozitívnym** a **12 falošne negatívnym** prípadom. V porovnaní s jednoduchým klasifikačným stromom dosahuje Random Forest lepšiu vyváženosť medzi presnosťou a citlivosťou, najmä pri identifikácii drahých nehnuteľností.
+
+```{r}
+tibble(
+  Accuracy = accuracy_vec(test_cls$is_expensive, rf_class),
+  F1 = f_meas_vec(test_cls$is_expensive, rf_class, event_level = "second")
+) |>
+  kbl("Random Forest – metriky (test)")
+```
+
+Model Random Forest dosahuje **presnosť 84 %** a **F1 skóre 0.62**, čo predstavuje citeľné zlepšenie oproti jednoduchému klasifikačnému stromu. Vyššia hodnota F1 skóre naznačuje lepšiu rovnováhu medzi presnosťou a citlivosťou pri identifikácii drahých nehnuteľností. Výsledky potvrdzujú, že využitie súborových metód vedie k stabilnejšiemu a robustnejšiemu klasifikačnému výkonu.
+
+```{r}
+#| label: cls-rf-roc
+roc_rf <- roc_curve(
+  tibble(truth = test_cls$is_expensive, .pred_yes = rf_prob_yes),
+  truth = truth, .pred_yes,
+  event_level = "second"
+)
+
+auc_rf <- roc_auc(
+  tibble(truth = test_cls$is_expensive,
+         .pred_yes = rf_prob_yes),
+  truth = truth,
+  .pred_yes,
+  event_level = "second"
+)
+
+auc_rf
+autoplot(roc_rf) + labs(title = "ROC – Random Forest (klasifikácia)")
+```
+
+ROC krivka sa nachádza výrazne nad diagonálou náhodného klasifikátora a dosahuje hodnotu **AUC ≈ 0.92**, čo poukazuje na veľmi dobrú schopnosť modelu rozlišovať medzi triedami *„drahá“* a *„lacná“* nehnuteľnosť. Vysoká hodnota AUC potvrdzuje, že Random Forest dokáže spoľahlivo priraďovať vyššie pravdepodobnosti správnej triede naprieč rôznymi rozhodovacími prahmi, a patrí tak medzi najvýkonnejšie použité klasifikačné metódy.
+
+```{r}
+#| label: cls-rf-vip
+vip(fit_rf_cls, num_features = 15, geom = "col", aesthetics = list(alpha = 0.9)) +
+  labs(title = "Random Forest (klasifikácia) – permutation importance (top 15)")
+```
+
+Graf zobrazuje relatívnu dôležitosť jednotlivých premenných pri klasifikácii nehnuteľností pomocou metódy Random Forest. Najväčší vplyv na rozhodovanie modelu má **kvalita nehnuteľnosti**, nasledovaná **rozlohou** a **mierou kriminality v okolí**. Tieto premenné majú dominantný vplyv na to, či je nehnuteľnosť klasifikovaná ako drahá alebo lacná.
+
+Naopak, faktory ako **počet izieb**, **vek nehnuteľnosti** alebo **dostupnosť parkov** majú v porovnaní s ostatnými premennými len marginálny vplyv. Výsledky tak potvrdzujú, že model sa pri rozhodovaní opiera najmä o charakteristiky priamo súvisiace s kvalitou a atraktivitou lokality.
+
+## **Priame porovnanie strom vs RF (test)**
+
+```{r}
+#| label: cls-compare
+cls_res <- bind_rows(
+  tibble(
+    model = "Strom",
+    AUC = roc_auc_vec(test_cls$is_expensive, tree_prob, event_level = "second"),
+    Accuracy = accuracy_vec(test_cls$is_expensive, tree_class),
+    F1 = f_meas_vec(test_cls$is_expensive, tree_class, event_level = "second")
+  ),
+  tibble(
+    model = "Random Forest",
+    AUC = roc_auc_vec(test_cls$is_expensive, rf_prob_yes, event_level = "second"),
+    Accuracy = accuracy_vec(test_cls$is_expensive, rf_class),
+    F1 = f_meas_vec(test_cls$is_expensive, rf_class, event_level = "second")
+  )
+) |>
+  arrange(desc(AUC))
+
+kbl(cls_res, "Klasifikácia – porovnanie modelov (test)")
+```
+
+```{r}
+#| label: cls-compare-plot
+cls_res |>
+  pivot_longer(cols = c(AUC, Accuracy, F1), names_to = "metric", values_to = "value") |>
+  ggplot(aes(x = reorder(model, value), y = value)) +
+  geom_col(alpha = 0.9) +
+  coord_flip() +
+  facet_wrap(~metric, scales = "free") +
+  labs(title = "Klasifikácia: porovnanie strom vs RF", x = NULL, y = NULL)
+```
+
+Z porovnania metrík je zrejmé, že **Random Forest výrazne prekonáva jednoduchý klasifikačný strom** vo všetkých hodnotených ukazovateľoch. Dosahuje vyššiu presnosť (Accuracy ≈ 0.84 vs. 0.78), vyššie F1 skóre aj výrazne lepšiu hodnotu AUC (0.92 oproti 0.81), čo znamená lepšiu schopnosť rozlišovať medzi triedami *„drahá“* a *„lacná“* nehnuteľnosť.
+
+# **Diskusia výsledkov**
+
+V práci sme analyzovali správanie stromových modelov v dvoch rôznych úlohách – **regresii (predikcia ceny nehnuteľnosti)** a **klasifikácii (drahá vs. lacná nehnuteľnosť)**. Táto kombinácia umožnila porovnať vlastnosti jednotlivých metód v rôznych typoch úloh.
+
+V regresnej úlohe sa ukázalo, že **jednoduchý rozhodovací strom** síce poskytuje dobrú interpretovateľnosť, avšak trpí vyššou varianciou a výrazným rizikom preučenia. Prerezávanie stromu v tomto prípade neviedlo k zlepšeniu testovacej chyby, čo naznačuje, že pôvodný strom už bol z hľadiska generalizácie relatívne stabilný; výraznejšie zlepšenie však priniesli až súborové metódy.
+
+**Bagging** výrazne stabilizoval výsledky tým, že redukoval variabilitu medzi jednotlivými stromami a poskytol spoľahlivejší odhad pomocou OOB chyby.
+
+**Random Forest** dosiahol ešte lepšie výsledky vďaka zníženej korelácii medzi stromami, čo sa prejavilo nižšou chybou aj lepšou generalizáciou na testovacích dátach.
+
+V regresnej úlohe dosahoval najlepšie výsledky **boosting**, ktorý dokázal zachytiť komplexné nelineárne vzťahy medzi premennými. Jeho nevýhodou však ostáva citlivosť na nastavenie hyperparametrov a potenciálne preučenie pri príliš dlhom učení.
+
+V klasifikačnej úlohe (rozlíšenie „drahá“ vs. „lacná“ nehnuteľnosť) sa potvrdilo, že:
+
+-   **klasifikačný strom** poskytuje interpretovateľné rozhodnutia, ale má nižšiu presnosť,
+
+-   **Random Forest** dosahuje vyššiu presnosť, lepšiu AUC a stabilnejšie výsledky,
+
+-   ROC krivky a confusion matrixe umožňujú detailnejšie porovnanie správania modelov.
+
+BART model v regresnej úlohe navyše poskytol **pravdepodobnostnú interpretáciu výstupov** a intervaly spoľahlivosti, čo je významná výhoda pri rozhodovaní v praxi.
+
+# **Záver**
+
+V tomto projekte bola analyzovaná úloha predikcie cien nehnuteľností pomocou rozhodovacích stromov a ich rozšírení. Na simulovaných dátach sme demonštrovali použitie stromových metód v regresii aj klasifikácii.
+
+Porovnali sme jednoduchý rozhodovací strom, bagging, random forest, boosting a BART, pričom každá metóda mala svoje výhody z hľadiska presnosti, interpretovateľnosti a stability.
+
+Výsledky ukázali, že zatiaľ čo jednoduché stromy sú dobre interpretovateľné, súborové metódy dosahujú výrazne lepšiu generalizáciu. Random Forest a boosting poskytli najlepší kompromis medzi presnosťou a robustnosťou, zatiaľ čo BART umožnil kvantifikovať neistotu predikcií.
+
+Projekt tak demonštruje praktické využitie stromových metód v regresných aj klasifikačných úlohách a ilustruje ich silné aj slabé stránky v kontexte analýzy reálnych dát.
